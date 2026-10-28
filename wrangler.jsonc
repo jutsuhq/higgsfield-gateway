@@ -1,0 +1,49 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "higgsfield-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  // No public API: clients reach the gateway through Service Bindings only.
+  // The webhook route needs a custom domain or route, set in WEBHOOK_BASE_URL.
+  "workers_dev": false,
+  "preview_urls": false,
+  // Copying a result into R2 is I/O, not CPU; this stops a flood of webhook calls from running up CPU.
+  "limits": { "cpu_ms": 1000 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hf_gateway",
+      // Replace with the id from `wrangler d1 create hf_gateway`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "hf-media" }],
+  "workflows": [{ "binding": "GENERATE_JOB", "name": "generate-job", "class_name": "GenerateJob" }],
+  // One events queue per client, bound as EVENTS_<CLIENT ID IN CAPITALS>.
+  "queues": {
+    "producers": [
+      { "binding": "EVENTS_BOT", "queue": "hf-events-bot" },
+      { "binding": "EVENTS_WEB", "queue": "hf-events-web" }
+    ]
+  },
+  // Reconciles stuck and timed-out jobs.
+  "triggers": { "crons": ["17 * * * *"] },
+  "vars": {
+    "HF_BASE_URL": "https://api.higgsfield.ai",
+    // The account's concurrency tier (docs/higgsfield-api.md, Rate limits).
+    "HF_CONCURRENCY": "4",
+    "GLOBAL_DAILY_CAP_CENTS": "5000",
+    // Public https origin of this Worker; Higgsfield posts webhooks to <origin>/hf/webhook/<job>/<token>.
+    "WEBHOOK_BASE_URL": "https://hf-gateway.example.com",
+    // Hosts a result may be downloaded from. The REST result host is not confirmed yet:
+    // the account's results come from this CloudFront host (docs/higgsfield-api.md).
+    "RESULT_HOSTS": "d8j0ntlcm91z4.cloudfront.net,cdn.higgsfield.ai",
+    "MAX_RESULT_BYTES": "104857600",
+    "R2_ACCOUNT_ID": "replace-with-account-id",
+    "R2_BUCKET": "hf-media"
+  }
+  // Secrets (wrangler secret put): HF_KEY ("<key id>:<key secret>"), HF_WEBHOOK_SECRET ("whsec_…"),
+  // R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY (an R2 API token with read-only access to hf-media).
+}

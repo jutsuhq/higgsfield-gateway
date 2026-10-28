@@ -1,0 +1,51 @@
+{
+  "name": "higgsfield-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Secure, budget-capped Higgsfield API gateway on Cloudflare Workers: Workflows, D1, R2, signed webhooks, Genjutsu and Seedance video generation.",
+  "keywords": [
+    "higgsfield",
+    "higgsfield-api",
+    "cloudflare-workers",
+    "cloudflare-workflows",
+    "cloudflare-d1",
+    "cloudflare-r2",
+    "ai-video",
+    "video-generation",
+    "motion-transfer",
+    "face-swap",
+    "seedance",
+    "genjutsu",
+    "webhooks",
+    "telegram-bot",
+    "grammy"
+  ],
+  "homepage": "https://github.com/jutsuhq/higgsfield-gateway#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jutsuhq/higgsfield-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jutsuhq/higgsfield-gateway/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc",
+    "db:migrate": "wrangler d1 migrations apply hf_gateway --remote",
+    "db:migrate:local": "wrangler d1 migrations apply hf_gateway --local"
+  },
+  "dependencies": {
+    "aws4fetch": "1.0.20"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.7",
+    "@cloudflare/workers-types": "5.20261025.1",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5",
+    "wrangler": "4.152.0"
+  }
+}

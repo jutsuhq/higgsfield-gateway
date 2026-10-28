@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # wrangler, workers-types and the Vitest plugin move together with workerd.
+      cloudflare:
+        patterns: ["wrangler", "@cloudflare/*"]
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

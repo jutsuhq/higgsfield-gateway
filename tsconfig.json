@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022", "esnext.disposable"],
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": ["src", "test"]
+}
