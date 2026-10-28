@@ -45,10 +45,10 @@
     "aws4fetch": "1.0.20"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.4.7",
+    "@cloudflare/vitest-plugin": "1.4.9",
     "@cloudflare/workers-types": "5.20261025.1",
     "typescript": "7.0.2",
     "vitest": "5.0.5",
-    "wrangler": "4.152.0"
+    "wrangler": "4.154.0"
   }
 }
