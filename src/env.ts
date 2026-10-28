@@ -24,7 +24,7 @@ export interface Env {
 export type Model = "genjutsu-light/motion-transfer" | "seedance-2.5/reference-to-video";
 export type Resolution = "480p" | "720p" | "1080p";
 export type AspectRatio = "21:9" | "16:9" | "4:3" | "1:1" | "3:4" | "9:16";
-export type JobStatus = "reserved" | "submitted" | "completed" | "failed" | "nsfw" | "canceled" | "timeout";
+export type JobStatus = "reserved" | "submitted" | "completed" | "failed" | "nsfw" | "canceled" | "timeout" | "expired";
 
 export interface JobEvent {
   jobId: string;

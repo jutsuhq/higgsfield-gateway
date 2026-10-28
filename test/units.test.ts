@@ -3,6 +3,7 @@ import { Higgsfield, HiggsfieldError, usdToCents } from "../src/higgsfield";
 import { imageSize, inspectImage } from "../src/media";
 import { nearestAspectRatio } from "../src/models";
 import { readerOf, readMp4Info } from "../src/mp4";
+import { maxResultBytes, resultHosts } from "../src/result";
 import { verifyWebhook } from "../src/webhook";
 import { jpeg, json, mockFetch, mp4, png } from "./helpers";
 
@@ -121,5 +122,39 @@ describe("MP4 and input checks", () => {
     expect(nearestAspectRatio(1920, 1080)).toBe("16:9");
     expect(nearestAspectRatio(1000, 1000)).toBe("1:1");
     expect(nearestAspectRatio(2560, 1080)).toBe("21:9");
+  });
+
+  it("gives up on headers with too many boxes or segments", async () => {
+    // 1001 empty boxes before moov: each one would cost a range read without the cap.
+    const file = mp4({ seconds: 2, width: 720, height: 1280 });
+    const boxes = new Uint8Array(8 * 1001 + file.length);
+    const view = new DataView(boxes.buffer);
+    for (let at = 0; at < 8 * 1001; at += 8) {
+      view.setUint32(at, 8);
+      boxes.set(new TextEncoder().encode("free"), at + 4);
+    }
+    boxes.set(file, 8 * 1001);
+    expect(await info(boxes)).toBeNull();
+
+    // 1000 APP0 segments, then a valid SOF0 the cap never reaches.
+    const at = 2 + 4 * 1000;
+    const segments = new Uint8Array(at + 9);
+    segments.set([0xff, 0xd8]);
+    for (let start = 2; start < at; start += 4) segments.set([0xff, 0xe0, 0x00, 0x02], start);
+    segments.set([0xff, 0xc0, 0x00, 0x11, 0x08, 0x07, 0x80, 0x04, 0x38], at);
+    expect(imageSize(segments, "image/jpeg")).toBeNull();
+  });
+});
+
+describe("result settings", () => {
+  it("requires a result host list and a positive size cap", () => {
+    expect(resultHosts("cdn.example.com, CDN.example.net")).toEqual(["cdn.example.com", "cdn.example.net"]);
+    expect(() => resultHosts("")).toThrow("RESULT_HOSTS");
+    expect(() => resultHosts(undefined)).toThrow("RESULT_HOSTS");
+    expect(() => resultHosts("<your-result-cdn-host>")).toThrow("RESULT_HOSTS");
+    expect(maxResultBytes("1024")).toBe(1024);
+    expect(() => maxResultBytes(undefined)).toThrow("MAX_RESULT_BYTES");
+    expect(() => maxResultBytes("0")).toThrow("MAX_RESULT_BYTES");
+    expect(() => maxResultBytes("abc")).toThrow("MAX_RESULT_BYTES");
   });
 });

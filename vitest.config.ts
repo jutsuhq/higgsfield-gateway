@@ -16,6 +16,7 @@ export default defineConfig({
           HF_WEBHOOK_SECRET: "whsec_dGVzdC13ZWJob29rLXNlY3JldA==",
           R2_ACCESS_KEY_ID: "test-access-key",
           R2_SECRET_ACCESS_KEY: "test-secret-key",
+          RESULT_HOSTS: "results.example.com,cdn.higgsfield.ai",
         },
       },
     })),

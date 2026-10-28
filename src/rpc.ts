@@ -1,5 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
+  cancelReserved,
   findByClientJobId,
   getClient,
   getJob,
@@ -14,6 +15,7 @@ import { Higgsfield } from "./higgsfield";
 import { loadSources } from "./jobs";
 import { declaredType, inspectImage, inspectStoredVideo, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, streamToR2 } from "./media";
 import { isModel, MODELS, type JobSpec } from "./models";
+import { maxResultBytes, resultHosts } from "./result";
 
 export interface CreateJobRequest extends JobSpec {
   clientJobId: string;
@@ -70,6 +72,9 @@ abstract class ClientEntrypoint extends WorkerEntrypoint<Env> {
       throw new GatewayError("invalid_input", "clientJobId must be 1–200 characters");
     }
     if (!(req.maxUsd > 0)) throw new GatewayError("invalid_input", "maxUsd must be positive");
+    // A bad result config fails here, before the client is charged, not at delivery.
+    resultHosts(this.env.RESULT_HOSTS);
+    maxResultBytes(this.env.MAX_RESULT_BYTES);
     const client = await this.allowed(req.model, req.resolution);
 
     const existing = await findByClientJobId(this.env.DB, this.clientId, req.clientJobId);
@@ -131,7 +136,8 @@ abstract class ClientEntrypoint extends WorkerEntrypoint<Env> {
   async cancelJob(jobId: string): Promise<void> {
     const job = await this.ownJob(jobId);
     if (job.status === "reserved") {
-      await settle(this.env.DB, job, "canceled", 0);
+      // One guarded batch: only the call that actually flips the job may release its budget.
+      if (!(await cancelReserved(this.env.DB, job))) throw new GatewayError("not_cancelable", "the job left the queue");
       return;
     }
     if (job.status !== "submitted" || !job.hf_request) throw new GatewayError("not_cancelable", job.status);

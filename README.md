@@ -21,7 +21,7 @@ The gateway owns the API key, the media and the budget, and never spends past it
 
 ## Status
 
-**Alpha.** The gateway is implemented and tested against a mocked Higgsfield API, but has not run against the live API yet.
+**Alpha.** The gateway is implemented and tested against a mocked Higgsfield API. The observations marked **(live)** in [docs/higgsfield-api.md](docs/higgsfield-api.md) come from a private account calling the real API in October 2026; the gateway itself has not been run end to end against it.
 Before the first deploy, confirm that the Genjutsu Light REST endpoint accepts requests (open question 1 in [docs/architecture.md](docs/architecture.md#open-questions)).
 
 ## Why Higgsfield Gateway
@@ -35,13 +35,13 @@ Calling the Higgsfield API straight from a bot or app is easy. Running it as a p
 
 Higgsfield Gateway puts all of that in one isolated Cloudflare Worker. Your apps only ask it to generate.
 
-- **Hard budget limits.** Spending is reserved in D1 before submit: a per-job price ceiling, a per-client daily cap and a global cap. Each job is checked against `/estimate` first.
+- **Hard budget limits.** Spending is reserved in D1 before submit: a per-job price ceiling, a per-client daily cap and a global cap. `createJob` checks the local list price; before submit the job is re-priced by `/estimate` and checked against both the client's `maxUsd` and the operator's per-job cap.
 - **Durable jobs on Cloudflare Workflows.** Submit, wait for the webhook with `step.waitForEvent`, fall back to status polling, then deliver. Each job is one Workflow instance.
 - **Idempotent by design.** Every submission carries an `Idempotency-Key`, so a retry never pays twice. Clients pass their own job id and get the same job back.
 - **Signed webhook verification.** Higgsfield webhooks are checked with Standard Webhooks HMAC-SHA256, a 5-minute timestamp window and `webhook-id` deduplication.
 - **Concurrency control.** The gateway tracks your Higgsfield concurrency tier itself, globally and per client, instead of hitting `429 account_queue_full`.
 - **Private media on R2.** Inputs go to Higgsfield through presigned URLs that expire in hours. Lifecycle rules delete inputs and results, and job data is deleted on Higgsfield after delivery.
-- **Isolated by default.** No public API: clients call it through Service Bindings (Workers RPC), each client has its own entrypoint and cannot impersonate another, and the only public route is the webhook.
+- **Isolated by default.** No public API: clients call it through Service Bindings (Workers RPC), each client has its own entrypoint and cannot impersonate another, and the only public route is the webhook. Isolation rests on per-Worker bindings and deploy rights: the entrypoint name is not a secret, so do not give one client's team deploy access to another client's Worker, or to the gateway.
 - **Event-driven delivery.** Results reach clients through Cloudflare Queues, so a client that is down briefly loses nothing.
 - **Cheap to run.** About $5 a month of Cloudflare usage at 10,000 videos a month, as estimated in [docs/costs.md](docs/costs.md).
 
@@ -77,9 +77,10 @@ flowchart LR
   RPC --> D1
   RPC --> WF
   WF -- submit with Idempotency-Key --> HF
-  HF -- presigned GET --> R2
+  HF -- presigned GET of inputs --> R2
   HF -- signed webhook --> HOOK
   HOOK -- sendEvent --> WF
+  WF -- download result --> HF
   WF --> R2
   WF --> Q
   Q --> BOT
@@ -110,7 +111,12 @@ npx wrangler queues create hf-events-bot
 npx wrangler queues create hf-events-web
 ```
 
-**3. Configure.** Set `vars` in `wrangler.jsonc`: `WEBHOOK_BASE_URL` (the custom domain), `R2_ACCOUNT_ID`, `HF_CONCURRENCY` and `GLOBAL_DAILY_CAP_CENTS`.
+**3. Configure.** Set `vars` in `wrangler.jsonc`:
+- `WEBHOOK_BASE_URL`: the public https origin of the webhook route.
+- `RESULT_HOSTS`: required, no default. Replace the placeholder with comma-separated hostnames results may be downloaded from, matched exactly, e.g. `cdn.higgsfield.ai`. `createJob` fails while the placeholder is still there.
+- `MAX_RESULT_BYTES`: the largest result to store, in bytes (`104857600` is 100 MB).
+- `R2_ACCOUNT_ID`, `R2_BUCKET` (`hf-media`), `HF_CONCURRENCY` (your account's limit) and `GLOBAL_DAILY_CAP_CENTS`.
+
 Add lifecycle rules on `hf-media` that delete `in/` and `out/` after 1–2 days.
 
 **4. Set the secrets:** `HF_KEY` (`<key id>:<key secret>`), `HF_WEBHOOK_SECRET` (`whsec_…`, revealed in the Higgsfield Console first), and `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` from an R2 token with read-only access to `hf-media`:
@@ -119,7 +125,11 @@ Add lifecycle rules on `hf-media` that delete `in/` and `out/` after 1–2 days.
 npx wrangler secret put HF_KEY
 ```
 
-**5. Migrate, add a client and deploy:**
+For local runs, copy [`.dev.vars.example`](.dev.vars.example) to `.dev.vars` and fill in the same four values.
+
+**5. Give the webhook a route.** Uncomment `routes` in `wrangler.jsonc` and set the same host as `WEBHOOK_BASE_URL` (add the custom domain to the Cloudflare account first if it is not there yet). Without a route the webhook never arrives and every job waits for polling.
+
+**6. Migrate, add a client and deploy:**
 
 ```bash
 npm run db:migrate
@@ -127,7 +137,7 @@ npx wrangler d1 execute hf_gateway --remote --command "INSERT INTO clients VALUE
 npm run deploy
 ```
 
-**6. Bind the gateway** in the client Worker and consume its events queue:
+**7. Bind the gateway** in the client Worker and consume its events queue:
 
 ```jsonc
 "services": [{ "binding": "HF", "service": "higgsfield-gateway", "entrypoint": "BotEntrypoint" }],

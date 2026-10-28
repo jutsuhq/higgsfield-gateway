@@ -3,6 +3,7 @@
 import { settle, SUBMIT_UNCERTAIN, type JobRow } from "./db";
 import { eventsQueue, usd, type Env } from "./env";
 import { Higgsfield, TERMINAL } from "./higgsfield";
+import { deliverResult } from "./result";
 
 const ALIVE = new Set(["queued", "running", "waiting", "paused", "waitingForPause"]);
 
@@ -44,12 +45,44 @@ async function reconcileJob(env: Env, hf: Higgsfield, job: JobRow): Promise<void
 
   const answer = await hf.status(job.hf_request);
   if (!TERMINAL.has(answer.status)) return;
-  const spent = answer.status === "completed" ? job.est_cents : 0;
-  const final = answer.status as Exclude<typeof answer.status, "queued" | "in_progress">;
-  // A timed-out job's client was told and refunded its user already; its late result is discarded.
-  const error = timedOut ? "finished_after_timeout" : "workflow_lost";
-  if (await settle(env.DB, job, final, spent, { error })) {
-    if (!timedOut) await emit(env, job, final, spent, error);
+
+  if (timedOut) {
+    // The client was told `timeout` and refunded its user already: close the row as `expired`, never
+    // as `completed`, and discard the late result. A completed request was still charged.
+    const spent = answer.status === "completed" ? job.est_cents : 0;
+    if (await settle(env.DB, job, "expired", spent, { error: "finished_after_timeout" })) {
+      await hf.delete(job.hf_request);
+    }
+    return;
+  }
+
+  if (answer.status === "completed") {
+    // Paid either way, so a result that cannot be stored still counts as spent.
+    if (!answer.videoUrl) {
+      if (await settle(env.DB, job, "failed", job.est_cents, { error: "missing_result" })) {
+        await emit(env, job, "failed", job.est_cents, "missing_result");
+        await hf.delete(job.hf_request);
+      }
+      return;
+    }
+    const delivered = await deliverResult(env, job.id, answer.videoUrl);
+    if ("error" in delivered) {
+      if (await settle(env.DB, job, "failed", job.est_cents, { error: delivered.error })) {
+        await emit(env, job, "failed", job.est_cents, delivered.error);
+        await hf.delete(job.hf_request);
+      }
+      return;
+    }
+    if (await settle(env.DB, job, "completed", job.est_cents, { error: "workflow_lost", resultKey: delivered.resultKey })) {
+      await emit(env, job, "completed", job.est_cents, "workflow_lost");
+      await hf.delete(job.hf_request);
+    }
+    return;
+  }
+
+  const final = answer.status as Exclude<typeof answer.status, "queued" | "in_progress" | "completed">;
+  if (await settle(env.DB, job, final, 0, { error: "workflow_lost" })) {
+    await emit(env, job, final, 0, "workflow_lost");
     await hf.delete(job.hf_request);
   }
 }

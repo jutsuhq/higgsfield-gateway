@@ -124,10 +124,13 @@ export async function acquireSlot(db: D1Database, job: JobRow, concurrency: numb
   return status === "reserved" ? "busy" : "gone";
 }
 
-/** Moves the reservation from `est_cents` to `exactCents`. False when a cap would be exceeded. */
-export async function adjustReservation(db: D1Database, job: JobRow, exactCents: number): Promise<boolean> {
+/**
+ * Moves the reservation from `est_cents` to `exactCents`. False when a cap would be exceeded, `lost`
+ * when the job left `submitted` in the meantime (canceled while the price was being checked).
+ */
+export async function adjustReservation(db: D1Database, job: JobRow, exactCents: number): Promise<boolean | "lost"> {
   try {
-    await db.batch([
+    const [, update] = await db.batch([
       db
         .prepare(
           `UPDATE spend SET reserved_cents = reserved_cents + ?1
@@ -139,11 +142,40 @@ export async function adjustReservation(db: D1Database, job: JobRow, exactCents:
         .prepare("UPDATE jobs SET est_cents = ?1 WHERE id = ?2 AND status = 'submitted' AND est_cents = ?3")
         .bind(exactCents, job.id, job.est_cents),
     ]);
-    return true;
+    if ((update?.meta.changes ?? 0) > 0) return true;
+    // A retried step whose first run already applied the new price.
+    const current = await getJob(db, job.id);
+    return current?.status === "submitted" && current.est_cents === exactCents ? true : "lost";
   } catch (e) {
     if (/budget_exceeded/.test(String(e))) return false;
     throw e;
   }
+}
+
+/**
+ * Cancels a job that still waits for a slot, releasing its reservation in the same batch. False when
+ * the job was submitted first: the guarded statements then change nothing, so no budget is released.
+ */
+export async function cancelReserved(db: D1Database, job: JobRow): Promise<boolean> {
+  const [, update] = await db.batch([
+    db
+      .prepare(
+        `UPDATE spend SET reserved_cents = reserved_cents - ?1
+         WHERE day = ?2 AND client_id IN (?3, '_global')
+           AND EXISTS (
+             SELECT 1 FROM jobs
+             WHERE id = ?4 AND status = 'reserved' AND hf_request IS NULL AND finished_at IS NULL
+           )`,
+      )
+      .bind(job.est_cents, job.spend_day, job.client_id, job.id),
+    db
+      .prepare(
+        `UPDATE jobs SET status = 'canceled', spent_cents = 0, finished_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND status = 'reserved' AND hf_request IS NULL AND finished_at IS NULL`,
+      )
+      .bind(job.id),
+  ]);
+  return (update?.meta.changes ?? 0) > 0;
 }
 
 export async function setRequest(db: D1Database, jobId: string, requestId: string, correlationId?: string) {

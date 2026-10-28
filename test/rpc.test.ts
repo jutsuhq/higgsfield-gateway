@@ -1,7 +1,7 @@
 import { introspectWorkflow } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { utcDay } from "../src/db";
+import { adjustReservation, cancelReserved, getJob, utcDay } from "../src/db";
 import { bot, mp4, png, resetDb, seedClient, seedInputs, spend, web } from "./helpers";
 
 // max_parallel 0 keeps every Workflow waiting for a slot, so these tests see only the RPC side.
@@ -84,6 +84,29 @@ describe("cancelJob", () => {
     await bot().cancelJob(jobId);
     expect(await bot().getJob(jobId)).toEqual({ status: "canceled", usd: 0 });
     expect(await spend("bot")).toEqual({ reserved: 0, spent: 0 });
+  });
+
+  it("releases nothing when the job was submitted before the cancel landed", async () => {
+    const { trendId, imageId } = await seedInputs("bot");
+    const { jobId } = await bot().createJob(genjutsu({ trendId }, imageId));
+    const job = (await getJob(env.DB, jobId))!;
+    await env.DB.prepare("UPDATE jobs SET status = 'submitted', hf_request = 'req-race' WHERE id = ?").bind(jobId).run();
+
+    expect(await cancelReserved(env.DB, job)).toBe(false);
+    expect((await getJob(env.DB, jobId))!.status).toBe("submitted");
+    expect(await spend("bot")).toEqual({ reserved: 100, spent: 0 });
+  });
+});
+
+describe("adjustReservation", () => {
+  it("reports a lost job instead of a silent no-op", async () => {
+    const { trendId, imageId } = await seedInputs("bot");
+    const { jobId } = await bot().createJob(genjutsu({ trendId }, imageId));
+    const job = (await getJob(env.DB, jobId))!;
+    await env.DB.prepare("UPDATE jobs SET status = 'canceled' WHERE id = ?").bind(jobId).run();
+
+    expect(await adjustReservation(env.DB, job, 120)).toBe("lost");
+    expect(await spend("bot")).toEqual({ reserved: 100, spent: 0 });
   });
 });
 

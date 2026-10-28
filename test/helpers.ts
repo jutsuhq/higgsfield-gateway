@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { vi } from "vitest";
 import { BotEntrypoint, WebEntrypoint } from "../src/rpc";
 
-export const RESULT_URL = "https://d8j0ntlcm91z4.cloudfront.net/u/result.mp4";
+export const RESULT_URL = "https://results.example.com/u/result.mp4";
 
 export async function resetDb(): Promise<void> {
   await env.DB.batch(
@@ -57,12 +57,12 @@ export type Route = (url: URL, init: RequestInit) => Response | Promise<Response
 
 /** Answers outbound fetches with the first route that returns a Response, and records every call. */
 export function mockFetch(...routes: Route[]) {
-  const calls: { method: string; url: URL; headers: Headers; body?: string }[] = [];
+  const calls: { method: string; url: URL; headers: Headers; body?: string; redirect: string }[] = [];
   const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init = {}) => {
     const request = new Request(input as RequestInfo, init);
     const url = new URL(request.url);
     const body = request.body ? await request.text() : undefined;
-    calls.push({ method: request.method, url, headers: request.headers, body });
+    calls.push({ method: request.method, url, headers: request.headers, body, redirect: request.redirect });
     for (const route of routes) {
       const answer = await route(url, { ...init, method: request.method, body });
       if (answer) return answer;

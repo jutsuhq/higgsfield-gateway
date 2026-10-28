@@ -7,9 +7,12 @@ export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
 /** The only documented minimum is 300 px a side (Kling's image inputs); smaller images make poor references anyway. */
 const MIN_IMAGE_SIDE = 300;
+/** A crafted file can hold millions of JPEG segments; a real one needs a handful. */
+const MAX_JPEG_SEGMENTS = 1000;
 /** R2 needs every part but the last to be the same size, and at least 5 MiB. */
 const PART_BYTES = 5 * 1024 * 1024;
-const PRESIGN_SECONDS = 2 * 60 * 60;
+/** Long enough to cover the submit retries and the replays of an uncertain submit. */
+const PRESIGN_SECONDS = 4 * 60 * 60;
 
 export function declaredType(contentType: string): string {
   return contentType.toLowerCase().split(";")[0]!.trim();
@@ -131,7 +134,8 @@ export function imageSize(b: Uint8Array, type: string): { width: number; height:
       return null;
     }
     case "image/jpeg": {
-      for (let at = 2; at + 9 <= b.byteLength; ) {
+      for (let at = 2, segments = 0; at + 9 <= b.byteLength; segments++) {
+        if (segments === MAX_JPEG_SEGMENTS) return null;
         if (b[at] !== 0xff) return null;
         const marker = b[at + 1]!;
         // SOF0–SOF15, except DHT (C4), JPG (C8) and DAC (CC), carry the frame size.
@@ -147,7 +151,7 @@ export function imageSize(b: Uint8Array, type: string): { width: number; height:
   }
 }
 
-/** A GET URL for one object, signed with the read-only R2 key and valid for 2 hours. */
+/** A GET URL for one object, signed with the read-only R2 key and valid for 4 hours. */
 export async function presign(env: Env, r2Key: string): Promise<string> {
   const client = new AwsClient({
     accessKeyId: env.R2_ACCESS_KEY_ID,

@@ -12,13 +12,16 @@ export type RangeReader = (offset: number, length: number) => Promise<Uint8Array
 
 /** moov holds sample tables, a few hundred KB for a 30 s clip; anything far larger isn't a clip we take. */
 const MAX_MOOV_BYTES = 16 * 1024 * 1024;
+/** Each top-level box costs a range read; a crafted 200 MB file of 8-byte boxes would cost millions. */
+const MAX_BOXES = 1000;
 
 /**
  * Walks the top-level boxes with one small read each, then reads moov alone. A file with moov at
  * the end (not "fast start") costs a few extra reads, never a full download.
  */
 export async function readMp4Info(read: RangeReader, size: number): Promise<Mp4Info | null> {
-  for (let at = 0; at + 8 <= size; ) {
+  for (let at = 0, boxes = 0; at + 8 <= size; boxes++) {
+    if (boxes === MAX_BOXES) return null;
     const head = await read(at, Math.min(16, size - at));
     const box = boxHeader(new DataView(head.buffer, head.byteOffset, head.byteLength), 0, size - at);
     if (!box) return null;

@@ -23,18 +23,19 @@ Clients (a chat bot, a web app) own users, credits, payments and delivery to the
 
 ```
 client ──RPC──► putInput(stream)            → R2 in/<id>
-client ──RPC──► createJob({clientJobId, …}) → check allow-list, input ownership and list price ≤ maxUsd
+client ──RPC──► createJob({clientJobId, …}) → check allow-list, input ownership and list price ≤ maxUsd, max_job_cents
                                             → one D1 batch: reserve list price (client + global) and insert job
                                             → start Workflow
 Workflow GenerateJob
   1 acquire concurrency slot: guarded UPDATE reserved → submitted (step.sleep 30 s while full)
   2 presign input URLs and build the request body in one step, so later retries reuse the same body
-  3 exact price: POST /estimate/<model> with that body → above maxUsd: fail and release
+  3 exact price: POST /estimate/<model> with that body → above maxUsd or max_job_cents: fail and release
                                                       → else adjust the reservation to it
   4 submit: POST /<model>?hf_webhook=…  Idempotency-Key: job.id  Hf-Expires-After: 86400
   5 wait: loop { waitForEvent("hf-done", 5 min) | on timeout: GET /requests/{id}/status }
           overall limit 90 min, then see "Timeouts" below
   6 completed → check result host and size → stream video.url into R2 out/<job>.mp4
+                (the cron runs the same delivery before settling a recovered job)
   7 settle: reserved → spent (exact estimate)   failed/nsfw/canceled → release
   8 emit: Queue message {jobId, clientJobId, status, usd}
   9 clean up: DELETE /requests/{id} on Higgsfield; R2 lifecycle removes files after 1–2 days
@@ -77,7 +78,7 @@ createJob({
     duration?: number,               // 4–30 s; default: the source's length
     generateAudio?: boolean,         // default: false, the source keeps its sound
   },
-  maxUsd: number,                    // checked against the list price now and the exact /estimate before submit
+  maxUsd: number,                    // checked against the list price now and the exact /estimate before submit, as is the operator's max_job_cents
 }): Promise<{ jobId: string; estUsd: number }>      // estUsd: the list price reserved
 getJob(jobId): Promise<{ status: JobStatus; usd?: number; error?: string }>
 cancelJob(jobId): Promise<void>      // effective while waiting for a slot or queued at Higgsfield
@@ -111,11 +112,12 @@ Job statuses:
 | `reserved` | Budget reserved, waiting for a slot | no |
 | `submitted` | Slot taken; submitted or about to be submitted to Higgsfield | yes |
 | `timeout` | 90-min limit passed while Higgsfield was still running it | yes, until reconciled |
+| `expired` | A `timeout` job closed by the cron; never a success, so a client that refunded stays right | no |
 | `completed`, `failed`, `nsfw`, `canceled` | Terminal, settled | no |
 
 ## Budget
 
-The per-job ceiling is checked in code first: `est_cents <= max_job_cents` and `est_cents <= maxUsd`.
+The per-job ceiling is checked in code first: `est_cents <= max_job_cents` and `est_cents <= maxUsd`. The exact `/estimate` is then checked against both again, because a ratio or option can price above the list table; `max_job_cents` is re-read from the client row for that check.
 Then `createJob` runs one `db.batch()`, which D1 executes as a transaction:
 
 ```sql
@@ -164,9 +166,13 @@ SET reserved_cents = reserved_cents - ?est, spent_cents = spent_cents + ?actual
 WHERE day = ?spend_day AND client_id IN (?client, '_global')
   AND EXISTS (SELECT 1 FROM jobs WHERE id = ?job AND status IN ('reserved', 'submitted', 'timeout'));
 
-UPDATE jobs SET status = ?final, finished_at = CURRENT_TIMESTAMP
+UPDATE jobs
+SET status = ?final, spent_cents = ?actual, error = ?error,
+    result_key = COALESCE(?result_key, result_key), finished_at = CURRENT_TIMESTAMP
 WHERE id = ?job AND status IN ('reserved', 'submitted', 'timeout');
 ```
+
+`settle` returns whether the jobs UPDATE changed a row. `finish` skips the event when it did not, so a job closed by the cron first cannot emit a second terminal event.
 
 `spend_day` is the day of the reservation, not today, so a job that runs past midnight UTC settles against the row it reserved on.
 
@@ -196,33 +202,34 @@ At the 90-min limit the Workflow reads the status once more:
 A submit whose outcome stays unknown after its replays ends the same way, with `error: "submit_uncertain"` and no `hf_request`.
 - terminal: handle it normally.
 
-The reconcile cron later settles each `timeout` job: `completed` moves the estimate to spent and discards the result, other terminal statuses release it. A `submit_uncertain` job has no request to ask about, so its estimate counts as spent.
+The reconcile cron later closes each `timeout` job as `expired`: a `completed` request moves the estimate to spent (its result is not downloaded), other terminal statuses release it. `expired` cannot be mistaken for success by a client that already saw `timeout` and refunded. A `submit_uncertain` job has no request to ask about, so its estimate counts as spent.
 
 ## Failure handling
 
 | Stage | Failure | Handling |
 |---|---|---|
-| createJob | budget exceeded, model not allowed, input of another client, list price above `maxUsd` | Error to the client. The batch rolls back, nothing is reserved. |
-| exact price | `/estimate` above `maxUsd`, or the higher price exceeds a cap | Mark failed, release, emit the event with the reason. |
+| createJob | budget exceeded, model not allowed, input of another client, list price above `maxUsd` or `max_job_cents` | Error to the client. The batch rolls back, nothing is reserved. |
+| exact price | `/estimate` above `maxUsd` or `max_job_cents`, or the higher price exceeds a cap | Mark failed, release, emit the event with the reason. |
 | exact price | `/estimate` refuses the body (`4xx`) | Same handling as a validation error at submit. |
-| submit | `400 "Maximum number of concurrent requests (N) …"`, `429 account_queue_full`, `503` | Refused, nothing accepted: step retry with backoff, `Retry-After` when present. Same `Idempotency-Key` and same body, so there is no duplicate charge. If retries run out, fail and release. |
-| submit | `5xx` other than `503`, network error, timeout | Outcome unknown: the job is flagged `submit_uncertain` and retried the same way. If retries run out, replay the submit every 20 min for 2 h: a replay returns the request Higgsfield may have accepted. If none answers, see [Timeouts](#timeouts); the cron then counts the estimate as spent and logs the job for a check against `GET /models/usage`. |
-| submit | `403` (balance empty), other `4xx` validation | `NonRetryableError`, release the reservation, alert the operator. |
-| submit | `422` idempotency mismatch | A bug: the body changed between retries. `NonRetryableError`, alert the operator, then reconcile by hand. |
+| submit | `400 "Maximum number of concurrent requests (N) …"`, `429 account_queue_full`, `503` | Refused, nothing accepted: step retry with a fixed 30 s exponential backoff. `Retry-After` is parsed but Workflows step retries cannot use it. Same `Idempotency-Key` and same body, so there is no duplicate charge. If retries run out, fail and release. |
+| submit | `5xx` other than `503`, network error, timeout | Outcome unknown: the job is flagged `submit_uncertain` and retried the same way. If retries run out, replay the submit every 20 min for 1 h, inside the 4 h presigned URLs: a replay returns the request Higgsfield may have accepted. If none answers, see [Timeouts](#timeouts); the cron then counts the estimate as spent and logs the job for a check against `GET /models/usage`. |
+| submit | `403` (balance empty), other `4xx` validation | The step returns a plain error result: fail and release the reservation. There is no alerting; the job's `error` is the record. |
+| submit | `422` idempotency mismatch | A bug: the body changed between retries. Fail the job and reconcile by hand. |
 | wait | webhook lost | Polling finds the status. |
 | wait | 90 min overall limit | See [Timeouts](#timeouts). |
-| deliver | `completed` without `video.url` | Paid but missing: settle as spent, mark failed, alert the operator. |
-| deliver | result larger than the client's limit, unexpected host | Mark failed, keep the file for manual review. |
+| deliver | `completed` without `video.url` | Paid but missing: settle as spent, mark failed. |
+| deliver | download fails after its retries | Settle as spent and mark failed, so the instance never dies with the reservation held. |
+| deliver | result larger than `MAX_RESULT_BYTES`, unexpected host, redirect | Mark failed as spent; nothing is kept. There is one global size limit, not a per-client one. |
 | settle | step retried | Idempotent: the status guard turns the second run into a no-op. |
 | any | instance crashed | An hourly Cron Trigger reconciles jobs stuck in `reserved`/`submitted` for more than 3 h, and every `timeout` job, against Higgsfield status. |
 
 ## Open questions
 
-1. **Blocker: does the Genjutsu Light REST endpoint work?** It has no published request schema (see [Higgsfield API notes](higgsfield-api.md#endpoints)). Check with one `/estimate` call and a real key before writing the Workflow. If it is refused, fall back to full Genjutsu, which costs several times more.
+1. **Unverified: does the Genjutsu Light REST endpoint work?** It has no published request schema (see [Higgsfield API notes](higgsfield-api.md#endpoints)). Check with one `/estimate` call and a real key before relying on it. If it is refused, fall back to full Genjutsu, which costs several times more.
 2. Webhooks have never been seen live: the signature headers, the body and the retries come from the docs only. Test them on the first paid run, with polling as the fallback.
-3. Does Higgsfield fetch input URLs on accept, or when the job starts? `/estimate` may fetch them as well. URLs are presigned right before the estimate and slots keep the Higgsfield queue short, so the 2 h TTL should be enough.
+3. Does Higgsfield fetch input URLs on accept, or when the job starts? `/estimate` may fetch them as well. URLs are presigned right before the estimate, live for 4 h and cover the 1 h replay window; slots keep the Higgsfield queue short.
 4. Is the Genjutsu Light output as long as its input, up to 15 s? Full Genjutsu's output follows the source, trimmed to 30 s.
 5. Output file sizes at 720p and 1080p, which matter for clients with an upload limit.
 6. How to measure user-uploaded video length without ffmpeg: parse MP4 `mvhd`, or trust the client's metadata?
-7. The account's real concurrency limit, and whether models have their own. The live `400` reported 4, which matches none of the documented tiers (2, 10, 20, 40), and the docs describe a `429` instead.
+7. The account's real concurrency limit, and whether models have their own. An observed `400` reported a limit that matches none of the documented tiers (2, 10, 20, 40), and the docs describe a `429` instead.
 8. Are Service Binding calls billed as Worker requests? The cost is negligible either way.

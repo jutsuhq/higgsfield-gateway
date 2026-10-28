@@ -3,19 +3,33 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
-import { acquireSlot, adjustReservation, getJob, markSubmitUncertain, markTimeout, setRequest, settle, SUBMIT_UNCERTAIN, type JobRow } from "./db";
+import {
+  acquireSlot,
+  adjustReservation,
+  getClient,
+  getJob,
+  markSubmitUncertain,
+  markTimeout,
+  setRequest,
+  settle,
+  SUBMIT_UNCERTAIN,
+  type JobRow,
+} from "./db";
 import { eventsQueue, usd, type Env, type JobStatus } from "./env";
 import { Higgsfield, HiggsfieldError, TERMINAL, type StatusAnswer } from "./higgsfield";
 import { buildRequest } from "./jobs";
+import { deliverResult, type Delivery } from "./result";
 
 /** 2 hours of 30 s waits for a concurrency slot. */
 const SLOT_ROUNDS = 240;
 /** 18 rounds of up to 5 min: the 90-minute limit, counted in rounds so replays stay deterministic. */
 const WAIT_ROUNDS = 18;
-/** 2 hours of replays after an uncertain submit, while the presigned URLs in its body still work. */
-const REPLAY_ROUNDS = 6;
+/** 1 hour of replays after an uncertain submit, inside the presigned URLs' 4 h lifetime. */
+const REPLAY_ROUNDS = 3;
 const HF_RETRIES = { retries: { limit: 5, delay: "10 seconds", backoff: "exponential" }, timeout: "1 minute" } as const;
 const SUBMIT_RETRIES = { retries: { limit: 8, delay: "30 seconds", backoff: "exponential" }, timeout: "1 minute" } as const;
+/** A result can be 100 MB: give the download its own long timeout, not the metadata step's minute. */
+const DELIVER_RETRIES = { retries: { limit: 3, delay: "30 seconds", backoff: "exponential" }, timeout: "15 minutes" } as const;
 
 type Final = Exclude<JobStatus, "reserved" | "submitted" | "timeout">;
 
@@ -47,20 +61,31 @@ export class GenerateJob extends WorkflowEntrypoint<Env, { jobId: string }> {
       return this.finish(step, jobId, hf, "failed", 0, `request: ${message(e)}`);
     }
 
-    // 3. Exact price for this body; the reservation moves to it.
-    const price = await step.do("price", HF_RETRIES, async () => {
-      const job = await load();
-      let cents: number;
-      try {
-        cents = await hf.estimate(request.endpoint, request.body);
-      } catch (e) {
-        if (e instanceof HiggsfieldError && !e.retryable) return { error: `estimate_refused: ${e.message}` };
-        throw e;
-      }
-      if (cents > job.max_cents) return { error: `over_max_usd: exact price $${usd(cents)}` };
-      if (!(await adjustReservation(db, job, cents))) return { error: "budget_exceeded" };
-      return { cents };
-    });
+    // 3. Exact price for this body; the reservation moves to it, checked against both ceilings:
+    // the client's maxUsd and the operator's max_job_cents, which only createJob saw so far.
+    const price = await step.do(
+      "price",
+      HF_RETRIES,
+      async (): Promise<{ cents: number } | { error: string } | { lost: true }> => {
+        const job = await load();
+        const client = await getClient(db, job.client_id);
+        if (!client) return { error: `unknown_client: ${job.client_id}` };
+        let cents: number;
+        try {
+          cents = await hf.estimate(request.endpoint, request.body);
+        } catch (e) {
+          if (e instanceof HiggsfieldError && !e.retryable) return { error: `estimate_refused: ${e.message}` };
+          throw e;
+        }
+        if (cents > job.max_cents) return { error: `over_max_usd: exact price $${usd(cents)}` };
+        if (cents > client.max_job_cents) return { error: `over_job_cap: exact price $${usd(cents)}` };
+        const adjusted = await adjustReservation(db, job, cents);
+        if (adjusted === "lost") return { lost: true };
+        if (!adjusted) return { error: "budget_exceeded" };
+        return { cents };
+      },
+    );
+    if ("lost" in price) return { status: "lost" };
     if ("error" in price) return this.finish(step, jobId, hf, "failed", 0, price.error);
 
     // 4. Submit. Refusals that charge nothing (busy, unavailable) and answers whose outcome is unknown
@@ -147,7 +172,13 @@ export class GenerateJob extends WorkflowEntrypoint<Env, { jobId: string }> {
         // Paid either way, so a missing or refused result still counts as spent.
         if (!answer.videoUrl) return this.finish(step, jobId, hf, "failed", job.est_cents, "missing_result");
         const videoUrl = answer.videoUrl;
-        const delivered = await step.do("deliver", HF_RETRIES, () => this.deliver(jobId, videoUrl));
+        let delivered: Delivery;
+        try {
+          delivered = await step.do("deliver", DELIVER_RETRIES, () => deliverResult(this.env, jobId, videoUrl));
+        } catch (e) {
+          // Settle explicitly instead of letting the instance die with the reservation held.
+          return this.finish(step, jobId, hf, "failed", job.est_cents, `deliver_failed: ${message(e)}`);
+        }
         if ("error" in delivered) return this.finish(step, jobId, hf, "failed", job.est_cents, delivered.error);
         return this.finish(step, jobId, hf, "completed", job.est_cents, undefined, delivered.resultKey);
       }
@@ -158,29 +189,6 @@ export class GenerateJob extends WorkflowEntrypoint<Env, { jobId: string }> {
       default:
         return this.finish(step, jobId, hf, "failed", 0, answer.error ?? "failed");
     }
-  }
-
-  /** Streams the result into R2 after checking where it comes from and how large it is. */
-  private async deliver(jobId: string, videoUrl: string): Promise<{ resultKey: string } | { error: string }> {
-    const url = new URL(videoUrl);
-    const hosts = this.env.RESULT_HOSTS.split(",").map((h) => h.trim().toLowerCase());
-    if (url.protocol !== "https:" || !hosts.includes(url.hostname.toLowerCase())) {
-      return { error: `unexpected_result_host: ${url.hostname}` };
-    }
-    const res = await fetch(url.toString());
-    if (!res.ok || !res.body) throw new Error(`result download answered ${res.status}`);
-    const length = Number(res.headers.get("Content-Length"));
-    if (!length) return { error: "result_without_length" };
-    if (length > Number(this.env.MAX_RESULT_BYTES)) return { error: `result_too_large: ${length} bytes` };
-
-    const resultKey = `out/${jobId}.mp4`;
-    const { readable, writable } = new FixedLengthStream(length);
-    const [, object] = await Promise.all([
-      res.body.pipeTo(writable),
-      this.env.MEDIA.put(resultKey, readable, { httpMetadata: { contentType: "video/mp4" } }),
-    ]);
-    if (!object) throw new Error("R2 refused the result");
-    return { resultKey };
   }
 
   /** Settles the budget, tells the client, and deletes the request's data on Higgsfield. */
@@ -195,9 +203,10 @@ export class GenerateJob extends WorkflowEntrypoint<Env, { jobId: string }> {
   ): Promise<{ status: string }> {
     const job = await step.do("settle", async () => {
       const job = (await getJob(this.env.DB, jobId))!;
-      await settle(this.env.DB, job, final, spentCents, { error, resultKey });
-      return job;
+      return (await settle(this.env.DB, job, final, spentCents, { error, resultKey })) ? job : null;
     });
+    // Reconcile closed it first: a second terminal event would refund and capture the same job.
+    if (!job) return { status: "already_settled" };
     await step.do("emit", async () => {
       await eventsQueue(this.env, job.client_id).send({
         jobId,

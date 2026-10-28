@@ -41,7 +41,7 @@ CREATE TABLE jobs (
   hf_request     TEXT UNIQUE,
   hf_correlation TEXT,                  -- X-Correlation-ID of the submit, for support
   hook_token     TEXT NOT NULL,         -- random, part of the webhook path
-  status         TEXT NOT NULL,         -- reserved|submitted|completed|failed|nsfw|canceled|timeout
+  status         TEXT NOT NULL,         -- reserved|submitted|completed|failed|nsfw|canceled|timeout|expired
   error          TEXT,
   result_key     TEXT,
   created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -73,8 +73,8 @@ Where the live behaviour differs from the docs, both are listed, and the gateway
 
 - The limit is on concurrency per account, and sometimes per model. Requests over the limit wait as `queued`.
 - **Docs:** the queue is capped at a multiple of the concurrency limit. When it is full, the API returns `429 account_queue_full` with `Retry-After`, and nothing is charged. ([rate limits](https://docs.higgsfield.ai/docs/concepts/rate-limits))
-- **Live:** at the limit the API answered `400 {"detail": "Maximum number of concurrent requests (4) has been reached"}`, with no `Retry-After` and no rate-limit headers. The message text is the only signal, and the number in it is the account's current limit.
-- The gateway treats both answers as "slot busy": the submit step retries with backoff (`Retry-After` when present), and the `400` text is matched before other `400`s are treated as validation errors.
+- **Live:** at the limit the API answered `400 {"detail": "Maximum number of concurrent requests (N) has been reached"}`, with no `Retry-After` and no rate-limit headers. The message text is the only signal, and the number in it is the account's current limit.
+- The gateway treats both answers as "slot busy": the submit step retries with a fixed 30 s exponential backoff (`Retry-After` is parsed but Workflows retries cannot use it), and the `400` text is matched before other `400`s are treated as validation errors.
 - Concurrency tiers by funds added in the last 28 days ([pricing](https://open.higgsfield.ai/pricing)):
 
   | Funds added | Concurrent requests |
@@ -123,7 +123,7 @@ The documentation does not say how an account qualifies for the max discount; it
 - [`@higgsfield/client`](https://github.com/higgsfield-ai/higgsfield-js) (MIT) is built on `axios` and `form-data`.
   - Its v2 API does not expose `Idempotency-Key` or `hf_webhook`.
   - It has not been tested on Workers.
-- The gateway calls the REST API with `fetch` instead. Four calls are needed: estimate, submit, status and delete.
+- The gateway calls the REST API with `fetch` instead. Five calls are needed: estimate, submit, status, cancel and delete.
 
 ## Terms of Use
 

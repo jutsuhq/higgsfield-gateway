@@ -8,6 +8,8 @@
   // The webhook route needs a custom domain or route, set in WEBHOOK_BASE_URL.
   "workers_dev": false,
   "preview_urls": false,
+  // Uncomment and set the webhook's public host; without a route the webhook never arrives.
+  // "routes": [{ "pattern": "hf-gateway.example.com", "custom_domain": true }],
   // Copying a result into R2 is I/O, not CPU; this stops a flood of webhook calls from running up CPU.
   "limits": { "cpu_ms": 1000 },
   "d1_databases": [
@@ -32,14 +34,15 @@
   "triggers": { "crons": ["17 * * * *"] },
   "vars": {
     "HF_BASE_URL": "https://api.higgsfield.ai",
-    // The account's concurrency tier (docs/higgsfield-api.md, Rate limits).
-    "HF_CONCURRENCY": "4",
+    // Your account's concurrency limit (docs/higgsfield-api.md, Rate limits); 2 is the new-account tier.
+    "HF_CONCURRENCY": "2",
     "GLOBAL_DAILY_CAP_CENTS": "5000",
     // Public https origin of this Worker; Higgsfield posts webhooks to <origin>/hf/webhook/<job>/<token>.
     "WEBHOOK_BASE_URL": "https://hf-gateway.example.com",
-    // Hosts a result may be downloaded from. The REST result host is not confirmed yet:
-    // the account's results come from this CloudFront host (docs/higgsfield-api.md).
-    "RESULT_HOSTS": "d8j0ntlcm91z4.cloudfront.net,cdn.higgsfield.ai",
+    // Required, no default: comma-separated hostnames a result may be downloaded from, matched exactly.
+    // Replace the placeholder with your account's result CDN host, e.g. "cdn.higgsfield.ai".
+    "RESULT_HOSTS": "<your-result-cdn-host>",
+    // Required: the largest result the gateway will store, in bytes.
     "MAX_RESULT_BYTES": "104857600",
     "R2_ACCOUNT_ID": "replace-with-account-id",
     "R2_BUCKET": "hf-media"

@@ -1,0 +1,6 @@
+# Copy to .dev.vars for `npm run dev`, then fill in real values. Never commit .dev.vars.
+# These four are secrets (`npx wrangler secret put <NAME>` in production); the rest are vars.
+HF_KEY="<key id>:<key secret>"
+HF_WEBHOOK_SECRET="whsec_<base64 secret>"
+R2_ACCESS_KEY_ID="<R2 access key id>"
+R2_SECRET_ACCESS_KEY="<R2 secret access key>"

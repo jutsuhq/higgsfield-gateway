@@ -1,9 +1,12 @@
 import { introspectWorkflow } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
+import type { WorkflowStep } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getJob } from "../src/db";
+import { getJob, settle, utcDay } from "../src/db";
+import { Higgsfield } from "../src/higgsfield";
 import { reconcile } from "../src/reconcile";
-import { bot, higgsfield, json, mockFetch, resetDb, resultFile, seedClient, seedInputs, spend } from "./helpers";
+import { GenerateJob } from "../src/workflow";
+import { bot, higgsfield, json, mockFetch, resetDb, RESULT_URL, resultFile, seedClient, seedInputs, spend } from "./helpers";
 
 const SUBMIT_PATH = "/higgsfield/genjutsu-light/motion-transfer/v1.0";
 
@@ -76,7 +79,7 @@ describe("GenerateJob", () => {
     expect(body).toMatchObject({ prompt: "", resolution: "480p" });
     expect(body.image_urls).toHaveLength(1);
     expect(new URL(body.video_url).hostname).toBe("replace-with-account-id.r2.cloudflarestorage.com");
-    expect(new URL(body.video_url).searchParams.get("X-Amz-Expires")).toBe("7200");
+    expect(new URL(body.video_url).searchParams.get("X-Amz-Expires")).toBe("14400");
     expect(calls.some((c) => c.method === "DELETE" && c.url.pathname === "/requests/req-1")).toBe(true);
   });
 
@@ -139,6 +142,19 @@ describe("GenerateJob", () => {
     expect(calls.some((c) => c.url.pathname === SUBMIT_PATH)).toBe(false);
   });
 
+  it("fails before submit when the exact price is above the operator's per-job cap", async () => {
+    await fastForward();
+    await env.DB.prepare("UPDATE clients SET max_job_cents = 300 WHERE id = 'bot'").run();
+    const { calls } = mockFetch(higgsfield({ usd: "4.60" }));
+    const { jobId } = await startJob(5);
+    await finished();
+
+    expect(await getJob(env.DB, jobId)).toMatchObject({ status: "failed", spent_cents: 0 });
+    expect((await getJob(env.DB, jobId))!.error).toMatch(/^over_job_cap/);
+    expect(await spend("bot")).toEqual({ reserved: 0, spent: 0 });
+    expect(calls.some((c) => c.url.pathname === SUBMIT_PATH)).toBe(false);
+  });
+
   it("releases the reservation of an nsfw result", async () => {
     await fastForward();
     mockFetch(higgsfield({ status: { status: "nsfw" } }));
@@ -154,6 +170,81 @@ describe("GenerateJob", () => {
     const { jobId } = await startJob();
     await finished();
     expect(await getJob(env.DB, jobId)).toMatchObject({ status: "failed", spent_cents: 50, error: "unexpected_result_host: evil.example" });
+  });
+
+  it("downloads a result that has no Content-Length", async () => {
+    await fastForward();
+    const chunks = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(4321));
+        controller.close();
+      },
+    });
+    mockFetch(higgsfield(), (url) => (url.toString() === RESULT_URL ? new Response(chunks) : undefined));
+    const { jobId } = await startJob();
+    await finished();
+    expect(await getJob(env.DB, jobId)).toMatchObject({ status: "completed", spent_cents: 50 });
+    expect((await env.MEDIA.head(`out/${jobId}.mp4`))?.size).toBe(4321);
+  });
+
+  it("refuses a redirect instead of following it", async () => {
+    await fastForward();
+    const { calls } = mockFetch(higgsfield(), (url) =>
+      url.toString() === RESULT_URL ? new Response(null, { status: 302, headers: { Location: "http://169.254.169.254/" } }) : undefined,
+    );
+    const { jobId } = await startJob();
+    await finished();
+    expect(await getJob(env.DB, jobId)).toMatchObject({ status: "failed", spent_cents: 50, error: "result_redirect: 302" });
+    expect(calls.find((c) => c.url.toString() === RESULT_URL)!.redirect).toBe("manual");
+  });
+
+  it("settles as failed when the download never succeeds", async () => {
+    await fastForward();
+    mockFetch(higgsfield(), (url) => {
+      if (url.toString() === RESULT_URL) throw new Error("network down");
+    });
+    const { jobId } = await startJob();
+    await finished();
+    const job = (await getJob(env.DB, jobId))!;
+    expect(job).toMatchObject({ status: "failed", spent_cents: 50 });
+    expect(job.error).toMatch(/^deliver_failed: network down/);
+    expect(await spend("bot")).toEqual({ reserved: 0, spent: 50 });
+  });
+
+  it("emits nothing when the job was settled by the cron first", async () => {
+    const { trendId, imageId } = await seedInputs("bot");
+    const { jobId } = await bot().createJob({
+      clientJobId: crypto.randomUUID(),
+      model: "genjutsu-light/motion-transfer",
+      resolution: "480p",
+      imageInputIds: [imageId],
+      video: { trendId },
+      maxUsd: 2,
+    });
+    // Reconcile closed the job before the Workflow's own settle step ran.
+    await settle(env.DB, (await getJob(env.DB, jobId))!, "canceled", 0);
+
+    // `finish` only reads `this.env`, so the prototype can run without the Workflow's constructor.
+    const { finish } = GenerateJob.prototype as unknown as {
+      finish(
+        this: { env: typeof env },
+        step: WorkflowStep,
+        jobId: string,
+        hf: Higgsfield,
+        final: string,
+        cents: number,
+      ): Promise<{ status: string }>;
+    };
+    const step = {
+      do: async (_name: string, configOrFn: unknown, fn?: unknown) => {
+        const run = (typeof configOrFn === "function" ? configOrFn : fn) as () => Promise<unknown>;
+        return run();
+      },
+    } as unknown as WorkflowStep;
+    const hf = new Higgsfield(env.HF_KEY, env.HF_BASE_URL);
+
+    expect(await finish.call({ env }, step, jobId, hf, "completed", 50)).toEqual({ status: "already_settled" });
+    expect((await getJob(env.DB, jobId))!.status).toBe("canceled");
   });
 
   it("keeps the reservation of a job past its time limit, and the cron settles it", async () => {
@@ -173,10 +264,35 @@ describe("GenerateJob", () => {
     expect(await bot().getJob(jobId)).toEqual({ status: "timeout", usd: 0.5 });
 
     vi.restoreAllMocks();
-    status = { status: "completed", video: { url: "https://d8j0ntlcm91z4.cloudfront.net/late.mp4" } };
+    status = { status: "completed", video: { url: "https://results.example.com/late.mp4" } };
     mockFetch(higgsfield({ status }));
     await reconcile(env);
-    expect(await getJob(env.DB, jobId)).toMatchObject({ status: "completed", spent_cents: 50, error: "finished_after_timeout" });
+    // The client already saw `timeout`: the late result is discarded and never labelled `completed`.
+    expect(await getJob(env.DB, jobId)).toMatchObject({ status: "expired", spent_cents: 50, error: "finished_after_timeout" });
+    expect(await spend("bot")).toEqual({ reserved: 0, spent: 50 });
+  });
+
+  it("delivers a job whose Workflow died before the result was copied", async () => {
+    const id = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO spend (client_id, day, cap_cents, reserved_cents) VALUES ('bot', ?, 1000, 50), ('_global', ?, 5000, 50)",
+      ).bind(utcDay(), utcDay()),
+      env.DB.prepare(
+        `INSERT INTO jobs (id, client_id, client_job_id, model, resolution, spec, est_cents, max_cents, spend_day, hook_token, status, hf_request, created_at)
+         VALUES (?, 'bot', ?, 'genjutsu-light/motion-transfer', '480p', '{}', 50, 100, ?, ?, 'submitted', 'req-lost', datetime('now', '-4 hours'))`,
+      ).bind(id, id, utcDay(), "ab".repeat(24)),
+    ]);
+    mockFetch(higgsfield(), resultFile);
+    await reconcile(env);
+
+    expect(await getJob(env.DB, id)).toMatchObject({
+      status: "completed",
+      spent_cents: 50,
+      error: "workflow_lost",
+      result_key: `out/${id}.mp4`,
+    });
+    expect((await env.MEDIA.head(`out/${id}.mp4`))?.size).toBe(1234);
     expect(await spend("bot")).toEqual({ reserved: 0, spent: 50 });
   });
 });
