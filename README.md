@@ -1,12 +1,12 @@
 <div align="center">
 
-![Higgsfield Gateway: a budget-capped gateway for the Higgsfield API on Cloudflare Workers](docs/assets/banner.png)
+![Higgsfield Gateway: a budget-capped gateway for the Higgsfield API on Cloudflare Workers](docs/assets/banner.webp)
 
 **A secure, budget-capped gateway for the [Higgsfield API](https://docs.higgsfield.ai) on Cloudflare Workers.**
 Run Genjutsu Light and Seedance 2.5 video jobs from your bots and web apps.
 The gateway owns the API key, the media and the budget, and never spends past its caps.
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [Architecture](docs/architecture.md) · [Security](docs/security.md) · [FAQ](#faq) · [Jutsu Studio](https://github.com/jutsuhq/jutsu-studio)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Higgsfield API notes](docs/higgsfield-api.md) · [Architecture](docs/architecture.md) · [Security](docs/security.md) · [FAQ](#faq) · [Jutsu Studio](https://github.com/jutsuhq/jutsu-studio)
 
 [![CI](https://github.com/jutsuhq/higgsfield-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/jutsuhq/higgsfield-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8b5cf6.svg)](LICENSE)
@@ -35,12 +35,14 @@ Calling the Higgsfield API straight from a bot or app is easy. Running it as a p
 
 Higgsfield Gateway puts all of that in one isolated Cloudflare Worker. Your apps only ask it to generate.
 
+What the Higgsfield API does in production, from webhooks to rate limits and the spending cap it does not have, is collected in [Higgsfield API notes](docs/higgsfield-api.md), with a source for each fact and the behaviour seen in live calls. A walkthrough is in [Higgsfield API in production](https://jutsustudio.com/blog/higgsfield-api-production/).
+
 - **Hard budget limits.** Spending is reserved in D1 before submit: a per-job price ceiling, a per-client daily cap and a global cap. `createJob` checks the local list price; before submit the job is re-priced by `/estimate` and checked against both the client's `maxUsd` and the operator's per-job cap.
 - **Durable jobs on Cloudflare Workflows.** Submit, wait for the webhook with `step.waitForEvent`, fall back to status polling, then deliver. Each job is one Workflow instance.
 - **Idempotent by design.** Every submission carries an `Idempotency-Key`, so a retry never pays twice. Clients pass their own job id and get the same job back.
 - **Signed webhook verification.** Higgsfield webhooks are checked with Standard Webhooks HMAC-SHA256, a 5-minute timestamp window and `webhook-id` deduplication.
 - **Concurrency control.** The gateway tracks your Higgsfield concurrency tier itself, globally and per client, instead of hitting `429 account_queue_full`.
-- **Private media on R2.** Inputs go to Higgsfield through presigned URLs that expire in hours. Lifecycle rules delete inputs and results, and job data is deleted on Higgsfield after delivery.
+- **Private media on R2.** Inputs go to Higgsfield through presigned URLs that expire in hours, and a client can add at most 50 inputs per 24 h. Lifecycle rules delete inputs and results, and job data is deleted on Higgsfield after delivery.
 - **Isolated by default.** No public API: clients call it through Service Bindings (Workers RPC), each client has its own entrypoint and cannot impersonate another, and the only public route is the webhook. Isolation rests on per-Worker bindings and deploy rights: the entrypoint name is not a secret, so do not give one client's team deploy access to another client's Worker, or to the gateway.
 - **Event-driven delivery.** Results reach clients through Cloudflare Queues, so a client that is down briefly loses nothing.
 - **Cheap to run.** About $5 a month of Cloudflare usage at 10,000 videos a month, as estimated in [docs/costs.md](docs/costs.md).
@@ -162,11 +164,20 @@ Adding a client takes a `WorkerEntrypoint` subclass in [src/rpc.ts](src/rpc.ts),
 ## Documentation
 
 - [Architecture](docs/architecture.md): components, RPC contract, D1 schema, job lifecycle, failure handling
-- [Higgsfield API notes](docs/higgsfield-api.md): auth, statuses, idempotency, webhook signatures, rate limits, pricing, each with a source link
+- [Higgsfield API notes](docs/higgsfield-api.md): auth, statuses, idempotency, webhook signatures, rate limits, pricing, each with a source link and live observations
 - [Security model](docs/security.md): isolation, spending limits, webhook verification, data retention
 - [Costs](docs/costs.md): per-video Higgsfield cost and Cloudflare cost at 1k and 10k videos a month
 
 ## FAQ
+
+**How do I call the Higgsfield API from Cloudflare Workers?**
+With plain `fetch`: `Authorization: Key KEY_ID:KEY_SECRET`, a POST to the model path on `https://api.higgsfield.ai`, then poll `GET /requests/{id}/status` or receive a webhook. Keep the key in a Worker secret, never in a browser or app. This gateway wraps that in a Workflow with budget checks, webhook verification and R2 storage.
+
+**What does `429 account_queue_full` mean?**
+The account has more queued requests than its queue allows, which is a multiple of its concurrency limit; nothing is charged. In live calls the API answered `400 {"detail": "Maximum number of concurrent requests (N) has been reached"}` instead, so the gateway treats both as "slot busy" and retries. See [rate limits](docs/higgsfield-api.md#rate-limits).
+
+**Does Higgsfield retry webhooks?**
+Yes. The endpoint must answer `2xx` within 10 seconds; network errors and `5xx` are retried for up to 2 hours, `4xx` is not retried. Duplicates happen, so the gateway deduplicates by `webhook-id` and still polls in case a delivery is lost.
 
 **How do I verify Higgsfield webhook signatures in Cloudflare Workers?**
 Higgsfield signs deliveries with the Standard Webhooks scheme: HMAC-SHA256 over `{webhook-id}.{webhook-timestamp}.{body}`, keyed with your `whsec_` secret.
@@ -189,6 +200,7 @@ Prices for every model are in the [Higgsfield price table](https://jutsustudio.c
 
 ## Related
 
+- [Higgsfield API in production](https://jutsustudio.com/blog/higgsfield-api-production/): webhooks, idempotency, rate limits and spending caps, explained
 - [Jutsu Studio](https://github.com/jutsuhq/jutsu-studio): the unofficial open-source Mac app for Higgsfield
 - [Swapjutsu](https://github.com/jutsuhq/swapjutsu-seedance-character-swap): open-source Seedance 2.5 character swap for Mac
 - [Video API prices](https://github.com/jutsuhq/video-api-prices): what one second of AI video costs at 30+ API providers, updated daily
