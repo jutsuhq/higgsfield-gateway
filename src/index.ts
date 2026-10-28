@@ -36,11 +36,15 @@ export default {
       .first<{ hook_token: string; status: string }>();
     if (!job || !sameText(job.hook_token, token)) return new Response(null, { status: 404 });
 
+    // A job no longer waiting on Higgsfield (closed, or left to the cron): nothing to wake. Checked before
+    // the insert, so a delivery that arrives before submit does not consume its webhook-id.
+    if (job.status !== "submitted") return new Response(null, { status: 200 });
+
     const fresh = await env.DB.prepare("INSERT OR IGNORE INTO webhook_events (id) VALUES (?)")
       .bind(request.headers.get("webhook-id"))
       .run();
-    // A repeat, or a job no longer waiting on Higgsfield (closed, or left to the cron): nothing to wake.
-    if (fresh.meta.changes === 0 || job.status !== "submitted") return new Response(null, { status: 200 });
+    // A repeat of a delivery already seen.
+    if (fresh.meta.changes === 0) return new Response(null, { status: 200 });
 
     // Only a wake-up: the Workflow reads the authoritative status itself, never this body.
     try {

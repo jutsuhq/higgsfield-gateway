@@ -64,8 +64,8 @@ Queues are still used, but only for fan-out of finished-job events to clients.
 ## RPC contract
 
 ```ts
-estimate({ model, resolution, inputSeconds }): Promise<{ usd: number }>   // list price, an upper bound
-putInput(body: ReadableStream, contentType: string): Promise<{ inputId: string }>
+estimate({ model, resolution, inputSeconds }): Promise<{ usd: number }>   // list price, an upper bound; inputSeconds must be > 0
+putInput(body: ReadableStream, contentType: string): Promise<{ inputId: string }>  // at most 50 uploads per client in 24 h
 createJob({
   clientJobId: string,               // idempotency key on the client side
   model: "genjutsu-light/motion-transfer" | "seedance-2.5/reference-to-video",
@@ -92,6 +92,8 @@ openResult(jobId): Promise<ReadableStream>
   "services": [{ "binding": "HF", "service": "higgsfield-gateway", "entrypoint": "BotEntrypoint" }]
   ```
 
+- `estimate` and `createJob` reject a malformed spec with `invalid_input` before touching D1 or R2: `inputSeconds` must be a finite number above 0, and `video` must name exactly one of `trendId` or `inputId`.
+- `putInput` accepts at most 50 uploads per client per 24 h (`MAX_PENDING_INPUTS`), counted from `inputs.created_at`; over that it returns `over_quota`. Nothing deletes unused inputs yet, so this bounds the table and R2.
 - Every query by `jobId` or `inputId` also filters on that client id. A job or input that belongs to another client gets the same `not_found` error as one that does not exist, so ids cannot be probed.
 - `createJob` with an existing `(client, clientJobId)` returns the existing job.
 
@@ -179,6 +181,7 @@ WHERE id = ?job AND status IN ('reserved', 'submitted', 'timeout');
 ## Concurrency
 
 There is no separate slot table: the slots in use are jobs in `submitted` or `timeout`.
+`createJob` parses `HF_CONCURRENCY` before reserving anything, so a non-positive or non-integer value fails the call instead of a job at step 1.
 Step 1 takes a slot with one guarded statement and sleeps 30 s while it returns `meta.changes = 0`:
 
 ```sql
@@ -196,7 +199,7 @@ A slot is freed when the job reaches a terminal status. If an instance crashes w
 
 At the 90-min limit the Workflow reads the status once more:
 
-- `queued`: call `cancel`. `202` means the job is `canceled` and the reservation is released. `400` means it has started in the meantime: handle it as `in_progress`.
+- `queued`: call `cancel`. `202` means the job is `canceled` and the reservation is released. A `400` whose message says it already started (`already started`, `already processing`) means it has started in the meantime: handle it as `in_progress`. Any other `400` is a non-retryable error.
 - `in_progress`: Higgsfield will still finish and charge for it. Mark the job `timeout` and **keep the reservation**, emit a `timeout` event so the client refunds its user, and end the instance.
 
 A submit whose outcome stays unknown after its replays ends the same way, with `error: "submit_uncertain"` and no `hf_request`.
@@ -208,7 +211,7 @@ The reconcile cron later closes each `timeout` job as `expired`: a `completed` r
 
 | Stage | Failure | Handling |
 |---|---|---|
-| createJob | budget exceeded, model not allowed, input of another client, list price above `maxUsd` or `max_job_cents` | Error to the client. The batch rolls back, nothing is reserved. |
+| createJob | budget exceeded, model not allowed, input of another client, list price above `maxUsd` or `max_job_cents`, malformed spec, missing events queue, bad `HF_CONCURRENCY` | Error to the client. The batch rolls back, nothing is reserved. |
 | exact price | `/estimate` above `maxUsd` or `max_job_cents`, or the higher price exceeds a cap | Mark failed, release, emit the event with the reason. |
 | exact price | `/estimate` refuses the body (`4xx`) | Same handling as a validation error at submit. |
 | submit | `400 "Maximum number of concurrent requests (N) …"`, `429 account_queue_full`, `503` | Refused, nothing accepted: step retry with a fixed 30 s exponential backoff. `Retry-After` is parsed but Workflows step retries cannot use it. Same `Idempotency-Key` and same body, so there is no duplicate charge. If retries run out, fail and release. |
@@ -221,7 +224,7 @@ The reconcile cron later closes each `timeout` job as `expired`: a `completed` r
 | deliver | download fails after its retries | Settle as spent and mark failed, so the instance never dies with the reservation held. |
 | deliver | result larger than `MAX_RESULT_BYTES`, unexpected host, redirect | Mark failed as spent; nothing is kept. There is one global size limit, not a per-client one. |
 | settle | step retried | Idempotent: the status guard turns the second run into a no-op. |
-| any | instance crashed | An hourly Cron Trigger reconciles jobs stuck in `reserved`/`submitted` for more than 3 h, and every `timeout` job, against Higgsfield status. |
+| any | instance crashed | An hourly Cron Trigger reconciles jobs stuck in `reserved`/`submitted` for more than 3 h, oldest first, and every `timeout` job, against Higgsfield status. |
 
 ## Open questions
 

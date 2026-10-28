@@ -13,6 +13,7 @@ export async function reconcile(env: Env): Promise<void> {
     `SELECT * FROM jobs
      WHERE status = 'timeout'
         OR (status IN ('reserved', 'submitted') AND created_at < datetime('now', '-3 hours'))
+     ORDER BY created_at
      LIMIT 50`,
   ).all<JobRow>();
 

@@ -27,6 +27,15 @@ export function maxResultBytes(value: string | undefined): number {
   return bytes;
 }
 
+/** The account's concurrency tier, parsed in createJob so a bad value fails a call, not a queued job. */
+export function hfConcurrency(value: string | undefined): number {
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error(`HF_CONCURRENCY must be a positive integer, got ${value}`);
+  }
+  return limit;
+}
+
 /** Streams `videoUrl` into R2, refusing redirects, unexpected hosts and oversized results. */
 export async function deliverResult(env: Env, jobId: string, videoUrl: string): Promise<Delivery> {
   const url = new URL(videoUrl);

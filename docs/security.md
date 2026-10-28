@@ -41,7 +41,7 @@ Keep `limits.cpu_ms` low on public routes.
 1. Reveal the webhook secret in the Higgsfield Console before going live. Until then, deliveries are unsigned.
 2. Verify the Standard Webhooks HMAC-SHA256 signature over the raw body. Compare in constant time and reject timestamps more than 5 minutes off.
 3. Check that the path token matches the job's `hook_token`.
-4. Deduplicate by `webhook-id` using a D1 primary key.
+4. Deduplicate by `webhook-id` using a D1 primary key, and record the id only once the job is `submitted`: a delivery that arrives before submit must not consume it.
 5. Treat the webhook as a wake-up signal only. Before settling money, read the authoritative status with `GET /requests/{id}/status`.
 
 ## Inputs and outputs

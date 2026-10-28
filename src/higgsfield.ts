@@ -70,7 +70,10 @@ export class Higgsfield {
       "Idempotency-Key": opts.idempotencyKey,
       "Hf-Expires-After": String(opts.expiresAfterSeconds),
     });
-    const answer = (await res.json()) as { request_id: string };
+    const answer = (await res.json()) as { request_id?: unknown };
+    if (typeof answer.request_id !== "string" || !answer.request_id.trim()) {
+      throw new HiggsfieldError("invalid", res.status, "accepted response without a request_id");
+    }
     return { requestId: answer.request_id, correlationId: res.headers.get("X-Correlation-ID") ?? undefined };
   }
 
@@ -88,6 +91,7 @@ export class Higgsfield {
       await this.send("POST", `/requests/${encodeURIComponent(requestId)}/cancel`);
       return "canceled";
     } catch (e) {
+      // The live 400 body is not documented, so any 400 here means "already running".
       if (e instanceof HiggsfieldError && e.status === 400) return "started";
       throw e;
     }

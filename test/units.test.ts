@@ -3,7 +3,7 @@ import { Higgsfield, HiggsfieldError, usdToCents } from "../src/higgsfield";
 import { imageSize, inspectImage } from "../src/media";
 import { nearestAspectRatio } from "../src/models";
 import { readerOf, readMp4Info } from "../src/mp4";
-import { maxResultBytes, resultHosts } from "../src/result";
+import { maxResultBytes, hfConcurrency, resultHosts } from "../src/result";
 import { verifyWebhook } from "../src/webhook";
 import { jpeg, json, mockFetch, mp4, png } from "./helpers";
 
@@ -50,11 +50,23 @@ describe("Higgsfield errors", () => {
     expect(call.headers.get("Hf-Expires-After")).toBe("3600");
   });
 
+  it.each([{ status: "queued" }, { request_id: "" }, { request_id: "  " }])(
+    "refuses an accepted submit without a request_id: %j",
+    async (body) => {
+      mockFetch(() => json(body));
+      const error = await hf
+        .submit("a/b", {}, { idempotencyKey: "k", webhookUrl: "https://x/h", expiresAfterSeconds: 3600 })
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(HiggsfieldError);
+      expect(error.retryable).toBe(false);
+    },
+  );
+
   it("reads cancel 202 as canceled and 400 as started", async () => {
     mockFetch(() => new Response(null, { status: 202 }));
     expect(await hf.cancel("r")).toBe("canceled");
     vi.restoreAllMocks();
-    mockFetch(() => json({ detail: "already processing" }, 400));
+    mockFetch(() => json({ detail: "Request is already being processed" }, 400));
     expect(await hf.cancel("r")).toBe("started");
   });
 
@@ -156,5 +168,13 @@ describe("result settings", () => {
     expect(() => maxResultBytes(undefined)).toThrow("MAX_RESULT_BYTES");
     expect(() => maxResultBytes("0")).toThrow("MAX_RESULT_BYTES");
     expect(() => maxResultBytes("abc")).toThrow("MAX_RESULT_BYTES");
+  });
+
+  it("requires a positive concurrency limit", () => {
+    expect(hfConcurrency("2")).toBe(2);
+    expect(() => hfConcurrency(undefined)).toThrow("HF_CONCURRENCY");
+    expect(() => hfConcurrency("0")).toThrow("HF_CONCURRENCY");
+    expect(() => hfConcurrency("-1")).toThrow("HF_CONCURRENCY");
+    expect(() => hfConcurrency("1.5")).toThrow("HF_CONCURRENCY");
   });
 });

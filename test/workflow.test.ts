@@ -295,6 +295,24 @@ describe("GenerateJob", () => {
     expect((await env.MEDIA.head(`out/${id}.mp4`))?.size).toBe(1234);
     expect(await spend("bot")).toEqual({ reserved: 0, spent: 50 });
   });
+
+  it("reconciles the oldest stuck jobs first", async () => {
+    const insert = env.DB.prepare(
+      `INSERT INTO jobs (id, client_id, client_job_id, model, resolution, spec, est_cents, max_cents, spend_day, hook_token, status, hf_request, created_at)
+       VALUES (?, 'bot', ?, 'genjutsu-light/motion-transfer', '480p', '{}', 50, 100, ?, ?, 'submitted', ?, datetime('now', '-4 hours', ?))`,
+    );
+    const ids = Array.from({ length: 51 }, () => crypto.randomUUID());
+    await env.DB.batch(ids.map((id, i) => insert.bind(id, id, utcDay(), "ab".repeat(24), `req-${i}`, `+${i} seconds`)));
+
+    mockFetch(higgsfield({ status: { status: "failed" } }));
+    await reconcile(env);
+
+    const { results } = await env.DB.prepare("SELECT id, status FROM jobs ORDER BY created_at").all<{ id: string; status: string }>();
+    expect(results).toHaveLength(51);
+    expect(results.slice(0, 50).every((row) => row.status === "failed")).toBe(true);
+    // The newest of the 51 is the one left for the next run.
+    expect(results[50]).toEqual({ id: ids[50], status: "submitted" });
+  });
 });
 
 describe("webhook route", () => {
@@ -317,14 +335,14 @@ describe("webhook route", () => {
     });
   }
 
-  async function seedJob() {
+  async function seedJob(status = "submitted") {
     const id = crypto.randomUUID();
     const token = "ab".repeat(24);
     await env.DB.prepare(
       `INSERT INTO jobs (id, client_id, client_job_id, model, resolution, spec, est_cents, max_cents, spend_day, hook_token, status)
-       VALUES (?, 'bot', ?, 'genjutsu-light/motion-transfer', '480p', '{}', 50, 100, '2026-10-26', ?, 'completed')`,
+       VALUES (?, 'bot', ?, 'genjutsu-light/motion-transfer', '480p', '{}', 50, 100, '2026-10-26', ?, ?)`,
     )
-      .bind(id, id, token)
+      .bind(id, id, token, status)
       .run();
     return { path: `/hf/webhook/${id}/${token}`, id, token };
   }
@@ -332,6 +350,16 @@ describe("webhook route", () => {
   it("accepts a signed delivery once and ignores repeats", async () => {
     const { path } = await seedJob();
     expect((await post(path)).status).toBe(200);
+    expect((await post(path)).status).toBe(200);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM webhook_events").first("n")).toBe(1);
+  });
+
+  it("does not consume a delivery that arrives before the job is submitted", async () => {
+    const { path, id } = await seedJob("reserved");
+    expect((await post(path)).status).toBe(200);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM webhook_events").first("n")).toBe(0);
+
+    await env.DB.prepare("UPDATE jobs SET status = 'submitted' WHERE id = ?").bind(id).run();
     expect((await post(path)).status).toBe(200);
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM webhook_events").first("n")).toBe(1);
   });

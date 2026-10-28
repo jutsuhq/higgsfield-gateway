@@ -18,7 +18,7 @@ import {
 import { eventsQueue, usd, type Env, type JobStatus } from "./env";
 import { Higgsfield, HiggsfieldError, TERMINAL, type StatusAnswer } from "./higgsfield";
 import { buildRequest } from "./jobs";
-import { deliverResult, type Delivery } from "./result";
+import { deliverResult, hfConcurrency, type Delivery } from "./result";
 
 /** 2 hours of 30 s waits for a concurrency slot. */
 const SLOT_ROUNDS = 240;
@@ -47,7 +47,7 @@ export class GenerateJob extends WorkflowEntrypoint<Env, { jobId: string }> {
     // 1. Concurrency slot.
     for (let round = 0; ; round++) {
       if (round === SLOT_ROUNDS) return this.finish(step, jobId, hf, "failed", 0, "no_slot");
-      const slot = await step.do(`slot ${round}`, async () => acquireSlot(db, await load(), Number(this.env.HF_CONCURRENCY)));
+      const slot = await step.do(`slot ${round}`, async () => acquireSlot(db, await load(), hfConcurrency(this.env.HF_CONCURRENCY)));
       if (slot === "gone") return { status: "gone" };
       if (slot === "acquired") break;
       await step.sleep(`wait for slot ${round}`, "30 seconds");

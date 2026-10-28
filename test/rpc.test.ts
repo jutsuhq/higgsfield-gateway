@@ -1,7 +1,8 @@
-import { introspectWorkflow } from "cloudflare:test";
+import { createExecutionContext, introspectWorkflow } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { adjustReservation, cancelReserved, getJob, utcDay } from "../src/db";
+import { BotEntrypoint, type CreateJobRequest } from "../src/rpc";
 import { bot, mp4, png, resetDb, seedClient, seedInputs, spend, web } from "./helpers";
 
 // max_parallel 0 keeps every Workflow waiting for a slot, so these tests see only the RPC side.
@@ -24,6 +25,29 @@ const genjutsu = (video: { trendId: string }, imageId: string, clientJobId = "c1
   imageInputIds: [imageId],
   video,
   maxUsd: 5,
+});
+
+/** An entrypoint over `env` with some bindings or vars overridden. */
+function botWith(overrides: Record<string, unknown>) {
+  const patched = new Proxy(env, {
+    get: (target, prop: string | symbol) => (Object.hasOwn(overrides, prop) ? overrides[prop as string] : Reflect.get(target, prop)),
+  });
+  return new BotEntrypoint(createExecutionContext(), patched as typeof env);
+}
+
+describe("estimate", () => {
+  it("refuses a non-positive or non-finite input length", async () => {
+    for (const inputSeconds of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(bot().estimate({ model: "genjutsu-light/motion-transfer", resolution: "480p", inputSeconds })).rejects.toThrow(
+        "invalid_input",
+      );
+    }
+  });
+
+  it("prices a valid input length from the list price", async () => {
+    // 480p: $0.05/s × (10 s output + 10 s input)
+    expect(await bot().estimate({ model: "genjutsu-light/motion-transfer", resolution: "480p", inputSeconds: 10 })).toEqual({ usd: 1 });
+  });
 });
 
 describe("createJob", () => {
@@ -63,6 +87,35 @@ describe("createJob", () => {
     await expect(bot().createJob({ ...genjutsu({ trendId }, imageId), maxUsd: 0.5 })).rejects.toThrow("over_max_usd");
     await expect(web().createJob(genjutsu({ trendId }, imageId))).rejects.toThrow("not_found");
     await expect(bot().createJob({ ...genjutsu({ trendId }, imageId), imageInputIds: [] })).rejects.toThrow("invalid_input");
+  });
+
+  it("rejects a malformed spec as invalid_input before reading inputs", async () => {
+    const { trendId, imageId } = await seedInputs("bot");
+    const valid = genjutsu({ trendId }, imageId);
+    const create = (patch: Record<string, unknown>) => bot().createJob({ ...valid, ...patch } as unknown as CreateJobRequest);
+
+    await expect(create({ video: undefined })).rejects.toThrow("invalid_input");
+    await expect(create({ video: "trend" })).rejects.toThrow("invalid_input");
+    await expect(create({ video: {} })).rejects.toThrow("invalid_input");
+    await expect(create({ video: { trendId, inputId: imageId } })).rejects.toThrow("invalid_input");
+    await expect(create({ imageInputIds: imageId })).rejects.toThrow("invalid_input");
+    await expect(create({ prompt: 42 })).rejects.toThrow("invalid_input");
+    expect(await spend("bot")).toBeNull();
+  });
+
+  it("refuses a job when the client's events queue is not bound, before reserving", async () => {
+    const { trendId, imageId } = await seedInputs("bot");
+    await expect(botWith({ EVENTS_BOT: undefined }).createJob(genjutsu({ trendId }, imageId))).rejects.toThrow(
+      "No events queue bound for client bot",
+    );
+    expect(await spend("bot")).toBeNull();
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM jobs").first("n")).toBe(0);
+  });
+
+  it("fails fast on an invalid HF_CONCURRENCY before reserving", async () => {
+    const { trendId, imageId } = await seedInputs("bot");
+    await expect(botWith({ HF_CONCURRENCY: "0" }).createJob(genjutsu({ trendId }, imageId))).rejects.toThrow("HF_CONCURRENCY");
+    expect(await spend("bot")).toBeNull();
   });
 });
 
@@ -143,5 +196,28 @@ describe("putInput", () => {
     await expect(bot().putInput(new Blob(["not a video at all"]).stream(), "video/mp4")).rejects.toThrow("invalid_input");
     expect((await env.MEDIA.list({ prefix: "in/" })).objects).toHaveLength(0);
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM inputs").first("n")).toBe(0);
+  });
+
+  it("refuses more than 50 uploads per client in 24 h", async () => {
+    await env.DB.batch(
+      Array.from({ length: 50 }, (_, i) =>
+        env.DB.prepare("INSERT INTO inputs (id, client_id, r2_key, kind) VALUES (?, 'bot', ?, 'image')").bind(`recent-${i}`, `in/recent-${i}`),
+      ),
+    );
+    await expect(bot().putInput(new Blob([png(512, 768)]).stream(), "image/png")).rejects.toThrow("over_quota");
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM inputs").first("n")).toBe(50);
+    expect((await env.MEDIA.list({ prefix: "in/" })).objects).toHaveLength(0);
+  });
+
+  it("counts only the last 24 h against that cap", async () => {
+    await env.DB.batch(
+      Array.from({ length: 50 }, (_, i) =>
+        env.DB.prepare(
+          "INSERT INTO inputs (id, client_id, r2_key, kind, created_at) VALUES (?, 'bot', ?, 'image', datetime('now', '-2 days'))",
+        ).bind(`old-${i}`, `in/old-${i}`),
+      ),
+    );
+    const { inputId } = await bot().putInput(new Blob([png(512, 768)]).stream(), "image/png");
+    expect(await env.DB.prepare("SELECT client_id FROM inputs WHERE id = ?").bind(inputId).first("client_id")).toBe("bot");
   });
 });

@@ -10,12 +10,15 @@ import {
   type ClientRow,
   type JobRow,
 } from "./db";
-import { GatewayError, usd, type Env, type JobStatus, type Model, type Resolution } from "./env";
+import { eventsQueue, GatewayError, usd, type Env, type JobStatus, type Model, type Resolution } from "./env";
 import { Higgsfield } from "./higgsfield";
 import { loadSources } from "./jobs";
 import { declaredType, inspectImage, inspectStoredVideo, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, streamToR2 } from "./media";
 import { isModel, MODELS, type JobSpec } from "./models";
-import { maxResultBytes, resultHosts } from "./result";
+import { hfConcurrency, maxResultBytes, resultHosts } from "./result";
+
+/** Uploads a client may add in 24 h. Nothing deletes unused inputs yet, so this bounds the table and R2. */
+const MAX_PENDING_INPUTS = 50;
 
 export interface CreateJobRequest extends JobSpec {
   clientJobId: string;
@@ -34,6 +37,9 @@ abstract class ClientEntrypoint extends WorkerEntrypoint<Env> {
 
   /** List price in USD: an upper bound, before the exact quote the job gets before submit. */
   async estimate(req: { model: Model; resolution: Resolution; inputSeconds: number }): Promise<{ usd: number }> {
+    if (!Number.isFinite(req.inputSeconds) || req.inputSeconds <= 0) {
+      throw new GatewayError("invalid_input", "inputSeconds must be a finite number above 0");
+    }
     await this.allowed(req.model, req.resolution);
     const video = { r2Key: "", seconds: req.inputSeconds, width: 9, height: 16 };
     return { usd: usd(MODELS[req.model].listPriceCents(req.resolution, video, { imageInputIds: [], video: { inputId: "" } })) };
@@ -41,6 +47,15 @@ abstract class ClientEntrypoint extends WorkerEntrypoint<Env> {
 
   /** Images are checked in memory (10 MB at most); videos stream to R2 and are read back by range. */
   async putInput(body: ReadableStream<Uint8Array>, contentType: string): Promise<{ inputId: string }> {
+    const pending = await this.env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM inputs WHERE client_id = ? AND created_at >= datetime('now', '-1 day')",
+    )
+      .bind(this.clientId)
+      .first<number>("n");
+    if ((pending ?? 0) >= MAX_PENDING_INPUTS) {
+      throw new GatewayError("over_quota", `at most ${MAX_PENDING_INPUTS} uploads in 24 hours`);
+    }
+
     const id = crypto.randomUUID();
     const r2Key = `in/${id}`;
     const type = declaredType(contentType);
@@ -72,10 +87,15 @@ abstract class ClientEntrypoint extends WorkerEntrypoint<Env> {
       throw new GatewayError("invalid_input", "clientJobId must be 1–200 characters");
     }
     if (!(req.maxUsd > 0)) throw new GatewayError("invalid_input", "maxUsd must be positive");
-    // A bad result config fails here, before the client is charged, not at delivery.
+    // A malformed spec fails here, not as a TypeError inside loadSources or the model rules.
+    checkSpec(req);
+    // A bad result or concurrency config fails here, before the client is charged, not at delivery.
     resultHosts(this.env.RESULT_HOSTS);
     maxResultBytes(this.env.MAX_RESULT_BYTES);
+    hfConcurrency(this.env.HF_CONCURRENCY);
     const client = await this.allowed(req.model, req.resolution);
+    // The Workflow emits through this queue; a missing binding would only surface after the job runs.
+    eventsQueue(this.env, this.clientId);
 
     const existing = await findByClientJobId(this.env.DB, this.clientId, req.clientJobId);
     if (existing) return { jobId: existing.id, estUsd: usd(existing.est_cents) };
@@ -187,6 +207,31 @@ function spentCents(job: JobRow): number | undefined {
 
 function randomToken(): string {
   return [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Rejects a malformed spec before D1 or R2 is touched: a missing video would throw a TypeError in loadSources. */
+function checkSpec(req: CreateJobRequest): void {
+  const imageInputIds: unknown = req.imageInputIds;
+  if (imageInputIds !== undefined && (!Array.isArray(imageInputIds) || imageInputIds.some((id) => typeof id !== "string" || !id))) {
+    throw new GatewayError("invalid_input", "imageInputIds must be an array of non-empty ids");
+  }
+
+  const video: unknown = req.video;
+  if (typeof video !== "object" || video === null) {
+    throw new GatewayError("invalid_input", "video must be { trendId } or { inputId }");
+  }
+  const { trendId, inputId } = video as { trendId?: unknown; inputId?: unknown };
+  const trend = typeof trendId === "string" && trendId.length > 0;
+  const input = typeof inputId === "string" && inputId.length > 0;
+  if (trend === input) throw new GatewayError("invalid_input", "video must name exactly one of trendId or inputId");
+
+  if (req.prompt !== undefined && typeof req.prompt !== "string") {
+    throw new GatewayError("invalid_input", "prompt must be a string");
+  }
+  const seedance: unknown = req.seedance;
+  if (seedance !== undefined && (typeof seedance !== "object" || seedance === null || Array.isArray(seedance))) {
+    throw new GatewayError("invalid_input", "seedance must be an object");
+  }
 }
 
 async function readCapped(stream: ReadableStream<Uint8Array>, max: number): Promise<Uint8Array> {
